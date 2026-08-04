@@ -1,0 +1,877 @@
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+-- UUID para identificadores únicos
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Cifrado de datos
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Búsqueda de texto completo (opcional)
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- Crear esquema para la plataforma
+CREATE SCHEMA IF NOT EXISTS iot_platform;
+SET search_path TO iot_platform, public;
+
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'user',
+    full_name VARCHAR(100),
+    company VARCHAR(100),
+    phone VARCHAR(20),
+    preferences JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    last_login TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    email_verified BOOLEAN DEFAULT FALSE,
+    two_factor_enabled BOOLEAN DEFAULT FALSE,
+    two_factor_secret VARCHAR(255)
+);
+
+-- Comentarios para documentación
+COMMENT ON TABLE users IS 'Almacena información de usuarios del sistema';
+COMMENT ON COLUMN users.role IS 'Rol del usuario: admin, user, viewer';
+COMMENT ON COLUMN users.preferences IS 'Preferencias del usuario en formato JSON (tema, idioma, etc.)';
+
+CREATE TABLE IF NOT EXISTS devices (
+    id SERIAL PRIMARY KEY,
+    device_id VARCHAR(50) UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    device_type VARCHAR(20) NOT NULL,
+    variable VARCHAR(50) NOT NULL,
+    unit VARCHAR(20),
+    location VARCHAR(100),
+    mqtt_topic VARCHAR(100) NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    last_reading TIMESTAMPTZ,
+    last_value DECIMAL(10, 3),
+    min_value DECIMAL(10, 3),
+    max_value DECIMAL(10, 3),
+    avg_value DECIMAL(10, 3),
+    reading_count INTEGER DEFAULT 0
+);
+
+COMMENT ON TABLE devices IS 'Almacena sensores y actuadores del sistema';
+COMMENT ON COLUMN devices.device_type IS 'Tipo de dispositivo: sensor, actuator, gateway';
+COMMENT ON COLUMN devices.variable IS 'Variable que mide: temperatura, humedad, etc.';
+
+CREATE TABLE IF NOT EXISTS measurements (
+    id SERIAL,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    value DECIMAL(10, 3) NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    quality SMALLINT DEFAULT 100,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    is_anomaly BOOLEAN DEFAULT FALSE,
+    predicted_value DECIMAL(10, 3),
+    error_margin DECIMAL(10, 3)
+) PARTITION BY RANGE (timestamp);
+
+DO $$
+DECLARE
+    v_start_date DATE;
+    v_end_date DATE;
+    v_table_name TEXT;
+    v_partitions TEXT[] := ARRAY[
+        '2026-07-01', '2026-08-01', '2026-09-01', '2026-10-01',
+        '2026-11-01', '2026-12-01', '2027-01-01'
+    ];
+BEGIN
+    FOR i IN 1..array_length(v_partitions, 1) - 1 LOOP
+        v_start_date := v_partitions[i]::DATE;
+        v_end_date := v_partitions[i+1]::DATE;
+        v_table_name := 'measurements_' || TO_CHAR(v_start_date, 'YYYY_MM');
+        
+        EXECUTE format('
+            CREATE TABLE IF NOT EXISTS %I PARTITION OF measurements
+            FOR VALUES FROM (%L) TO (%L)
+        ', v_table_name, v_start_date, v_end_date);
+        
+        RAISE NOTICE 'Partición % creada para % - %', v_table_name, v_start_date, v_end_date;
+    END LOOP;
+END;
+$$;
+
+COMMENT ON TABLE measurements IS 'Mediciones de sensores, particionadas por tiempo';
+COMMENT ON COLUMN measurements.quality IS 'Calidad del dato: 0-100 (100 = excelente)';
+COMMENT ON COLUMN measurements.is_anomaly IS 'Indica si el dato es una anomalía detectada por ML';
+
+CREATE TABLE IF NOT EXISTS rules (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    description TEXT,
+    condition_type VARCHAR(20) NOT NULL,
+    value_min DECIMAL(10, 3),
+    value_max DECIMAL(10, 3),
+    delta DECIMAL(10, 3),
+    time_window INTEGER, 
+    action_type VARCHAR(20) NOT NULL,
+    action_target VARCHAR(255),
+    action_payload JSONB,
+    cooldown_seconds INTEGER DEFAULT 300,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    last_triggered TIMESTAMPTZ,
+    trigger_count INTEGER DEFAULT 0
+);
+
+COMMENT ON TABLE rules IS 'Reglas y umbrales configurados por usuarios';
+COMMENT ON COLUMN rules.condition_type IS 'Tipo de condición: gt, lt, between, changed';
+COMMENT ON COLUMN rules.action_type IS 'Acción a ejecutar: email, actuator, notification';
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id SERIAL PRIMARY KEY,
+    rule_id INTEGER REFERENCES rules(id) ON DELETE SET NULL,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    triggered_value DECIMAL(10, 3) NOT NULL,
+    severity VARCHAR(20) DEFAULT 'warning',
+    message TEXT,
+    is_acknowledged BOOLEAN DEFAULT FALSE,
+    is_resolved BOOLEAN DEFAULT FALSE,
+    triggered_at TIMESTAMPTZ DEFAULT NOW(),
+    acknowledged_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ,
+    resolved_value DECIMAL(10, 3),
+    notes TEXT
+);
+
+COMMENT ON TABLE alerts IS 'Alertas generadas por reglas y umbrales';
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(50) NOT NULL,
+    details JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    session_id VARCHAR(100)
+);
+
+COMMENT ON TABLE audit_log IS 'Registro de auditoría de todas las acciones del sistema';
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(30) NOT NULL,
+    -- Tipos: alert, info, warning, success, system
+    title VARCHAR(200) NOT NULL,
+    message TEXT,
+    link VARCHAR(500),
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    read_at TIMESTAMPTZ,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+COMMENT ON TABLE notifications IS 'Notificaciones para usuarios del sistema';
+
+CREATE TABLE IF NOT EXISTS performance_metrics (
+    id SERIAL PRIMARY KEY,
+    operation VARCHAR(50) NOT NULL,
+    avg_time DECIMAL(10, 3) NOT NULL,
+    min_time DECIMAL(10, 3),
+    max_time DECIMAL(10, 3),
+    count INTEGER NOT NULL DEFAULT 0,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE performance_metrics IS 'Métricas de rendimiento para monitoreo del sistema';
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(500) NOT NULL,
+    refresh_token VARCHAR(500),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_activity TIMESTAMPTZ DEFAULT NOW(),
+    ip_address INET,
+    user_agent TEXT,
+    is_revoked BOOLEAN DEFAULT FALSE
+);
+
+COMMENT ON TABLE sessions IS 'Sesiones activas de usuarios (JWT refresh)';
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX idx_users_created_at ON users(created_at DESC);
+
+CREATE INDEX idx_devices_user_id ON devices(user_id);
+CREATE INDEX idx_devices_variable ON devices(variable);
+CREATE INDEX idx_devices_device_type ON devices(device_type);
+CREATE INDEX idx_devices_is_active ON devices(is_active);
+CREATE INDEX idx_devices_last_reading ON devices(last_reading DESC);
+CREATE INDEX idx_devices_user_variable ON devices(user_id, variable);
+
+CREATE INDEX idx_devices_metadata ON devices USING GIN (metadata);
+
+CREATE INDEX idx_measurements_user_device_time 
+    ON measurements(user_id, device_id, timestamp DESC);
+
+CREATE INDEX idx_measurements_device_time 
+    ON measurements(device_id, timestamp DESC);
+
+CREATE INDEX idx_measurements_timestamp 
+    ON measurements(timestamp DESC);
+
+CREATE INDEX idx_measurements_anomaly 
+    ON measurements(is_anomaly) WHERE is_anomaly = true;
+
+CREATE INDEX idx_rules_user_id ON rules(user_id);
+CREATE INDEX idx_rules_device_id ON rules(device_id);
+CREATE INDEX idx_rules_is_active ON rules(is_active);
+CREATE INDEX idx_rules_user_device ON rules(user_id, device_id);
+
+CREATE INDEX idx_alerts_user_id ON alerts(user_id);
+CREATE INDEX idx_alerts_device_id ON alerts(device_id);
+CREATE INDEX idx_alerts_triggered_at ON alerts(triggered_at DESC);
+CREATE INDEX idx_alerts_is_resolved ON alerts(is_resolved) WHERE is_resolved = false;
+
+CREATE INDEX idx_audit_user_id ON audit_log(user_id);
+CREATE INDEX idx_audit_action ON audit_log(action);
+CREATE INDEX idx_audit_timestamp ON audit_log(timestamp DESC);
+
+CREATE INDEX idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX idx_notifications_is_read ON notifications(is_read) WHERE is_read = false;
+CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
+
+CREATE OR REPLACE VIEW v_devices_with_owner AS
+SELECT 
+    d.id,
+    d.device_id,
+    d.name AS device_name,
+    d.device_type,
+    d.variable,
+    d.unit,
+    d.location,
+    d.mqtt_topic,
+    d.is_active,
+    d.created_at,
+    d.updated_at,
+    d.last_reading,
+    d.last_value,
+    u.id AS owner_id,
+    u.username AS owner_username,
+    u.full_name AS owner_name,
+    u.email AS owner_email,
+    u.company AS owner_company
+FROM devices d
+JOIN users u ON d.user_id = u.id;
+
+CREATE OR REPLACE VIEW v_latest_measurements AS
+SELECT DISTINCT ON (device_id)
+    m.device_id,
+    d.name AS device_name,
+    d.variable,
+    d.unit,
+    m.value,
+    m.quality,
+    m.timestamp AS last_reading_time,
+    u.username AS owner_username,
+    u.full_name AS owner_name,
+    (EXTRACT(EPOCH FROM (NOW() - m.timestamp))) AS seconds_ago
+FROM measurements m
+JOIN devices d ON m.device_id = d.id
+JOIN users u ON d.user_id = u.id
+ORDER BY device_id, m.timestamp DESC;
+
+CREATE OR REPLACE VIEW v_device_statistics AS
+SELECT 
+    d.id,
+    d.device_id,
+    d.name AS device_name,
+    d.variable,
+    d.unit,
+    COUNT(m.id) AS total_readings,
+    AVG(m.value) AS avg_value,
+    MIN(m.value) AS min_value,
+    MAX(m.value) AS max_value,
+    STDDEV(m.value) AS stddev_value,
+    (MAX(m.timestamp) - MIN(m.timestamp)) AS time_range,
+    d.last_reading,
+    d.last_value
+FROM devices d
+LEFT JOIN measurements m ON d.id = m.device_id
+WHERE m.timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY d.id, d.device_id, d.name, d.variable, d.unit, d.last_reading, d.last_value;
+
+CREATE OR REPLACE VIEW v_pending_alerts AS
+SELECT 
+    a.id,
+    a.device_id,
+    d.name AS device_name,
+    d.variable,
+    a.triggered_value,
+    a.severity,
+    a.message,
+    a.triggered_at,
+    a.is_acknowledged,
+    u.id AS user_id,
+    u.username AS user_username,
+    u.full_name AS user_name,
+    r.name AS rule_name,
+    r.condition_type,
+    r.value_min,
+    r.value_max
+FROM alerts a
+JOIN devices d ON a.device_id = d.id
+JOIN users u ON a.user_id = u.id
+LEFT JOIN rules r ON a.rule_id = r.id
+WHERE a.is_resolved = false
+ORDER BY a.severity DESC, a.triggered_at ASC;
+
+CREATE OR REPLACE VIEW v_recent_activity AS
+SELECT 
+    al.id,
+    al.action,
+    al.details,
+    al.timestamp,
+    u.username,
+    u.full_name,
+    al.ip_address
+FROM audit_log al
+LEFT JOIN users u ON al.user_id = u.id
+WHERE al.timestamp >= NOW() - INTERVAL '7 days'
+ORDER BY al.timestamp DESC
+LIMIT 100;
+
+CREATE OR REPLACE VIEW v_ml_predictions AS
+SELECT 
+    m.device_id,
+    d.name AS device_name,
+    d.variable,
+    d.unit,
+    m.value AS actual_value,
+    m.predicted_value,
+    m.error_margin,
+    m.timestamp AS measured_at,
+    m.is_anomaly,
+    ABS(m.value - m.predicted_value) AS prediction_error
+FROM measurements m
+JOIN devices d ON m.device_id = d.id
+WHERE m.predicted_value IS NOT NULL
+    AND m.timestamp >= NOW() - INTERVAL '24 hours'
+ORDER BY m.timestamp DESC;
+
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_device_statistics()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE devices 
+    SET 
+        last_reading = NEW.timestamp,
+        last_value = NEW.value,
+        reading_count = reading_count + 1,
+        min_value = LEAST(COALESCE(min_value, NEW.value), NEW.value),
+        max_value = GREATEST(COALESCE(max_value, NEW.value), NEW.value),
+        avg_value = (COALESCE(avg_value, 0) * reading_count + NEW.value) / (reading_count + 1)
+    WHERE id = NEW.device_id;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION detect_anomaly()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_avg DECIMAL(10, 3);
+    v_stddev DECIMAL(10, 3);
+    v_threshold DECIMAL(10, 3);
+BEGIN
+    SELECT 
+        AVG(value),
+        STDDEV(value)
+    INTO 
+        v_avg,
+        v_stddev
+    FROM measurements
+    WHERE device_id = NEW.device_id
+        AND timestamp > NOW() - INTERVAL '24 hours'
+        AND id != NEW.id;
+    
+    IF v_stddev IS NOT NULL AND v_stddev > 0 THEN
+        v_threshold := v_avg + 3 * v_stddev;
+        IF ABS(NEW.value - v_avg) > v_threshold THEN
+            NEW.is_anomaly := true;
+        END IF;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_prediction(
+    p_device_id INTEGER,
+    p_hours_ahead INTEGER DEFAULT 1
+)
+RETURNS TABLE(
+    predicted_value DECIMAL(10, 3),
+    confidence_lower DECIMAL(10, 3),
+    confidence_upper DECIMAL(10, 3)
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        AVG(value) + 0.1 * EXTRACT(EPOCH FROM NOW()) AS predicted_value,
+        AVG(value) - 0.5 AS confidence_lower,
+        AVG(value) + 0.5 AS confidence_upper
+    FROM measurements
+    WHERE device_id = p_device_id
+        AND timestamp > NOW() - INTERVAL '24 hours';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER trigger_devices_updated_at
+    BEFORE UPDATE ON devices
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER trigger_update_device_stats
+    AFTER INSERT ON measurements
+    FOR EACH ROW
+    EXECUTE FUNCTION update_device_statistics();
+
+CREATE TRIGGER trigger_detect_anomaly
+    BEFORE INSERT ON measurements
+    FOR EACH ROW
+    EXECUTE FUNCTION detect_anomaly();
+
+INSERT INTO users (
+    username, 
+    email, 
+    password_hash, 
+    role, 
+    full_name, 
+    company,
+    email_verified
+) VALUES 
+    (
+        'admin',
+        'admin@iot.local',
+        '$2b$12$n5xrVy3VpD0Ml.lgjAHzQuFgPvVB.1XUvWFRVK5S2WrJYzYVtEyyi',
+        'admin',
+        'Administrador del Sistema',
+        'Universidad Nacional',
+        true
+    ),
+    (
+        'demo',
+        'demo@iot.local',
+        '$2b$12$n5xrVy3VpD0Ml.lgjAHzQuFgPvVB.1XUvWFRVK5S2WrJYzYVtEyyi',
+        'user',
+        'Usuario Demostración',
+        'IoT Lab',
+        true
+    ),
+    (
+        'juan.perez',
+        'juan.perez@empresa.com',
+        '$2b$12$n5xrVy3VpD0Ml.lgjAHzQuFgPvVB.1XUvWFRVK5S2WrJYzYVtEyyi',
+        'user',
+        'Juan Pérez',
+        'Tech Solutions',
+        true
+    ),
+    (
+        'maria.garcia',
+        'maria.garcia@universidad.edu',
+        '$2b$12$n5xrVy3VpD0Ml.lgjAHzQuFgPvVB.1XUvWFRVK5S2WrJYzYVtEyyi',
+        'user',
+        'María García',
+        'Universidad Nacional',
+        true
+    )
+ON CONFLICT (username) DO NOTHING;
+
+INSERT INTO devices (
+    device_id,
+    user_id,
+    name,
+    device_type,
+    variable,
+    unit,
+    location,
+    mqtt_topic,
+    metadata
+) 
+SELECT 
+    d.device_id,
+    u.id,
+    d.name,
+    d.device_type,
+    d.variable,
+    d.unit,
+    d.location,
+    d.mqtt_topic,
+    d.metadata::jsonb
+FROM (
+    VALUES 
+        (
+            'sensor_temp_001',
+            'Sensor Temperatura Oficina 301',
+            'sensor',
+            'temperatura',
+            '°C',
+            'Oficina 301',
+            'sensor/temperatura/001',
+            '{"brand": "DHT22", "precision": 0.5, "calibration_date": "2026-01-15"}'::jsonb
+        ),
+        (
+            'sensor_hum_001',
+            'Sensor Humedad Laboratorio 2',
+            'sensor',
+            'humedad',
+            '%',
+            'Laboratorio 2',
+            'sensor/humedad/001',
+            '{"brand": "DHT22", "precision": 2, "calibration_date": "2026-01-15"}'::jsonb
+        ),
+        (
+            'sensor_pres_001',
+            'Sensor Presión Sala Servidores',
+            'sensor',
+            'presion',
+            'hPa',
+            'Sala Servidores',
+            'sensor/presion/001',
+            '{"brand": "BMP280", "precision": 0.1, "calibration_date": "2026-01-20"}'::jsonb
+        ),
+        (
+            'sensor_luz_001',
+            'Sensor Luz Pasillo',
+            'sensor',
+            'luz',
+            'lux',
+            'Pasillo Principal',
+            'sensor/luz/001',
+            '{"brand": "BH1750", "precision": 1, "calibration_date": "2026-01-20"}'::jsonb
+        ),
+        (
+            'actuator_fan_001',
+            'Ventilador Principal',
+            'actuator',
+            'ventilador',
+            'boolean',
+            'Sala Servidores',
+            'actuator/ventilador/001',
+            '{"type": "centrifugal", "power": "120W", "max_rpm": 2500}'::jsonb
+        ),
+        (
+            'actuator_light_001',
+            'Luz Inteligente',
+            'actuator',
+            'iluminacion',
+            'boolean',
+            'Oficina 301',
+            'actuator/luz/001',
+            '{"type": "LED", "power": "12W", "color_temp": 4000}'::jsonb
+        )
+) AS d(device_id, name, device_type, variable, unit, location, mqtt_topic, metadata)
+CROSS JOIN (
+    SELECT id FROM users WHERE username = 'demo'
+) u
+UNION ALL
+SELECT 
+    'sensor_temp_admin_001',
+    u.id,
+    'Sensor Temperatura Planta Piloto',
+    'sensor',
+    'temperatura',
+    '°C',
+    'Planta Piloto',
+    'sensor/temperatura/admin/001',
+    '{"brand": "PT100", "precision": 0.1, "calibration_date": "2026-02-01"}'::jsonb
+FROM users u WHERE u.username = 'admin'
+ON CONFLICT (device_id) DO NOTHING;
+
+INSERT INTO rules (
+    user_id,
+    device_id,
+    name,
+    description,
+    condition_type,
+    value_min,
+    value_max,
+    action_type,
+    action_target,
+    cooldown_seconds
+)
+SELECT 
+    u.id,
+    d.id,
+    r.name,
+    r.description,
+    r.condition_type,
+    r.value_min,
+    r.value_max,
+    r.action_type,
+    r.action_target,
+    r.cooldown_seconds
+FROM (
+    VALUES 
+        (
+            'Alerta Temperatura Alta',
+            'sensor_temp_001',
+            'Dispara alerta cuando la temperatura supera los 30°C',
+            'gt',
+            30,
+            NULL,
+            'notification',
+            'demo@iot.local',
+            300
+        ),
+        (
+            'Alerta Temperatura Crítica',
+            'sensor_temp_001',
+            'Dispara alerta crítica cuando la temperatura supera los 35°C',
+            'gt',
+            35,
+            NULL,
+            'email',
+            'admin@iot.local',
+            600
+        ),
+        (
+            'Alerta Humedad Baja',
+            'sensor_hum_001',
+            'Dispara alerta cuando la humedad baja de 30%',
+            'lt',
+            NULL,
+            30,
+            'notification',
+            'demo@iot.local',
+            300
+        ),
+        (
+            'Alerta Humedad Alta',
+            'sensor_hum_001',
+            'Dispara alerta cuando la humedad supera el 80%',
+            'gt',
+            80,
+            NULL,
+            'actuator',
+            'actuator/fan/001',
+            600
+        ),
+        (
+            'Alerta Presión Baja',
+            'sensor_pres_001',
+            'Dispara alerta cuando la presión baja de 1000 hPa',
+            'lt',
+            NULL,
+            1000,
+            'notification',
+            'admin@iot.local',
+            3600
+        )
+) AS r(name, device_id, description, condition_type, value_min, value_max, action_type, action_target, cooldown_seconds)
+CROSS JOIN users u
+JOIN devices d ON d.device_id = r.device_id AND d.user_id = u.id
+WHERE u.username = 'demo'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO measurements (device_id, user_id, value, timestamp, quality)
+SELECT 
+    d.id,
+    u.id,
+    CASE 
+        WHEN d.variable = 'temperatura' THEN 22 + 5 * sin(extract(epoch from generate_series) / 3600) + random() * 2
+        WHEN d.variable = 'humedad' THEN 55 + 15 * sin(extract(epoch from generate_series) / 7200 + 1) + random() * 5
+        WHEN d.variable = 'presion' THEN 1013 + 5 * sin(extract(epoch from generate_series) / 10800) + random() * 2
+        WHEN d.variable = 'luz' THEN 300 + 200 * sin(extract(epoch from generate_series) / 43200 + 2) + random() * 50
+        ELSE 0
+    END,
+    generate_series,
+    95 + floor(random() * 5)::int
+FROM devices d
+JOIN users u ON d.user_id = u.id
+CROSS JOIN LATERAL generate_series(
+    NOW() - INTERVAL '24 hours',
+    NOW(),
+    INTERVAL '5 minutes'
+)
+WHERE d.device_type = 'sensor' AND d.is_active = true
+ON CONFLICT DO NOTHING;
+
+INSERT INTO notifications (user_id, type, title, message, created_at)
+SELECT 
+    u.id,
+    'info',
+    'Bienvenido a la Plataforma IoT',
+    'Tu plataforma de monitoreo en tiempo real está lista para usar.',
+    NOW() - INTERVAL '1 hour'
+FROM users u
+WHERE u.username IN ('demo', 'juan.perez', 'maria.garcia')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO audit_log (user_id, action, details, timestamp)
+SELECT 
+    u.id,
+    'login',
+    jsonb_build_object(
+        'method', 'password',
+        'success', true,
+        'ip', '192.168.1.100'
+    ),
+    NOW() - INTERVAL '1 hour' * generate_series(1, 10)
+FROM users u
+WHERE u.username IN ('admin', 'demo')
+ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE PROCEDURE archive_old_measurements(
+    p_days_to_keep INTEGER DEFAULT 30
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_cutoff_date TIMESTAMPTZ;
+BEGIN
+    v_cutoff_date := NOW() - (p_days_to_keep || ' days')::INTERVAL;
+    
+    CREATE TABLE IF NOT EXISTS measurements_archive (
+        LIKE measurements INCLUDING ALL
+    );
+    
+    INSERT INTO measurements_archive
+    SELECT * FROM measurements 
+    WHERE timestamp < v_cutoff_date;
+    
+    DELETE FROM measurements 
+    WHERE timestamp < v_cutoff_date;
+    
+    RAISE NOTICE 'Archivadas mediciones anteriores a %', v_cutoff_date;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE clean_audit_logs(
+    p_days_to_keep INTEGER DEFAULT 90
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    DELETE FROM audit_log 
+    WHERE timestamp < NOW() - (p_days_to_keep || ' days')::INTERVAL;
+    
+    RAISE NOTICE 'Logs de auditoría limpiados (mantenidos % días)', p_days_to_keep;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION generate_daily_report(
+    p_date DATE DEFAULT CURRENT_DATE
+)
+RETURNS TABLE(
+    metric_name TEXT,
+    metric_value TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 'Total de Mediciones'::TEXT, COUNT(*)::TEXT
+    FROM measurements
+    WHERE DATE(timestamp) = p_date
+    
+    UNION ALL
+    
+    SELECT 'Dispositivos Activos'::TEXT, COUNT(DISTINCT device_id)::TEXT
+    FROM measurements
+    WHERE DATE(timestamp) = p_date
+    
+    UNION ALL
+    
+    SELECT 'Alertas Generadas'::TEXT, COUNT(*)::TEXT
+    FROM alerts
+    WHERE DATE(triggered_at) = p_date
+    
+    UNION ALL
+    
+    SELECT 'Usuarios Activos'::TEXT, COUNT(DISTINCT user_id)::TEXT
+    FROM audit_log
+    WHERE DATE(timestamp) = p_date
+        AND action = 'login';
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+    v_table_name TEXT;
+    v_start_date DATE;
+    v_end_date DATE;
+BEGIN
+    v_start_date := DATE_TRUNC('month', NOW())::DATE;
+    v_end_date := (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')::DATE;
+    v_table_name := 'measurements_' || TO_CHAR(v_start_date, 'YYYY_MM');
+    
+    EXECUTE format('
+        CREATE TABLE IF NOT EXISTS %I PARTITION OF measurements
+        FOR VALUES FROM (%L) TO (%L)
+    ', v_table_name, v_start_date, v_end_date);
+    
+    RAISE NOTICE 'Partition % creada para % - %', v_table_name, v_start_date, v_end_date;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION reset_device_statistics(
+    p_device_id INTEGER
+)
+RETURNS VOID AS $$
+BEGIN
+    UPDATE devices 
+    SET 
+        reading_count = 0,
+        min_value = NULL,
+        max_value = NULL,
+        avg_value = NULL,
+        last_reading = NULL,
+        last_value = NULL
+    WHERE id = p_device_id;
+    
+    RAISE NOTICE 'Estadísticas reseteadas para dispositivo %', p_device_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE VIEW v_disk_usage AS
+SELECT 
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - 
+                   pg_relation_size(schemaname||'.'||tablename)) AS index_size,
+    pg_total_relation_size(schemaname||'.'||tablename) AS bytes
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY bytes DESC;
