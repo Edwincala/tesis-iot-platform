@@ -17,3 +17,10 @@ export interface User {
 
 export interface UserCreate extends Omit<User, 'id' | 'created_at' | 'updated_at'> {}
 export interface UserUpdate extends Partial<Omit<User, 'id' | 'created_at' | 'updated_at'>> {}
+export interface UserLogin {
+    username: string;
+    password: string;
+}
+export interface UserRegister extends UserCreate {
+    password: string;
+}
