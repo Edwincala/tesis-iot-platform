@@ -1,0 +1,146 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: iot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-iot_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iot_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-iot_platform}
+      TZ: "America/Bogota"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - iot_network
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: iot_mosquitto
+    restart: unless-stopped
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_WS_PORT:-9001}:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks:
+      - iot_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: iot_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - iot_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iot_backend
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${POSTGRES_USER:-iot_user}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-iot_pass}
+      - DB_NAME=${POSTGRES_DB:-iot_platform}
+      - MQTT_BROKER=mqtt://mosquitto:1883
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET=${JWT_SECRET:-tu-secreto}
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
+    depends_on:
+      - postgres
+      - mosquitto
+      - redis
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - iot_network
+    command: npm run dev
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: iot_frontend
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=development
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - iot_network
+    command: npm run dev
+
+  simulator:
+    build:
+      context: ./python-simulator
+      dockerfile: Dockerfile
+    container_name: iot_simulator
+    restart: unless-stopped
+    environment:
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+    depends_on:
+      - mosquitto
+    volumes:
+      - ./python-simulator:/app
+    networks:
+      - iot_network
+    command: python -u simulador.py
+
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: iot_ml_service
+    restart: unless-stopped
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${POSTGRES_USER:-iot_user}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-iot_pass}
+      - DB_NAME=${POSTGRES_DB:-iot_platform}
+    ports:
+      - "${ML_PORT:-8000}:8000"
+    depends_on:
+      - postgres
+    volumes:
+      - ./ml-service:/app
+      - ml_models:/app/models
+      - ml_logs:/app/logs
+    networks:
+      - iot_network
+    command: python main.py
+
+networks:
+  iot_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_log:
+  redis_data:
+  ml_models:
+  ml_logs:
